@@ -2,7 +2,7 @@ import os
 import requests
 import msal
 import logging
-from urllib.parse import quote  # <--- NEW IMPORT
+from urllib.parse import quote
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -13,8 +13,11 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 TENANT_ID = os.getenv("TENANT_ID")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN") 
 GLEAN_API_TOKEN = os.getenv("GLEAN_API_TOKEN")
-GLEAN_URL = os.getenv("GLEAN_URL") # Ensures we use the correct oida-be URL
+GLEAN_URL = os.getenv("GLEAN_URL")
 DATASOURCE = "powerbiconductor" 
+
+# TARGET WORKSPACE NAME (The one from your screenshot)
+TARGET_WORKSPACE_NAME = "Superstore"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Connector")
@@ -29,10 +32,14 @@ def get_access_token():
     authority = f"https://login.microsoftonline.com/{TENANT_ID}"
     client = msal.PublicClientApplication(CLIENT_ID, authority=authority)
     
+    # UPDATED SCOPES: Added Group.Read.All to access Shared Workspaces
     result = client.acquire_token_by_refresh_token(
         REFRESH_TOKEN, 
-        scopes=["https://analysis.windows.net/powerbi/api/Report.Read.All", 
-                "https://analysis.windows.net/powerbi/api/Dataset.Read.All"]
+        scopes=[
+            "https://analysis.windows.net/powerbi/api/Report.Read.All", 
+            "https://analysis.windows.net/powerbi/api/Dataset.Read.All",
+            "https://analysis.windows.net/powerbi/api/Group.Read.All" 
+        ]
     )
     
     if "access_token" in result:
@@ -42,65 +49,93 @@ def get_access_token():
         return None
 
 def sync_powerbi_to_glean():
-    logger.info("⏳ Starting Sync Job...")
+    logger.info("⏳ Starting Global Sync Job...")
     
     if not GLEAN_URL:
-        logger.error("❌ GLEAN_URL is missing! Check Render Environment Variables.")
-        return "Config Error"
+        return "Config Error: Missing GLEAN_URL"
 
     token = get_access_token()
     if not token: return "Auth Failed"
 
     headers = {"Authorization": f"Bearer {token}"}
     
-    # 1. Find the Report
-    logger.info("   Looking for 'Acme_Corp_Reports'...")
-    reports_url = "https://api.powerbi.com/v1.0/myorg/reports"
-    r = requests.get(reports_url, headers=headers)
-    reports = r.json().get("value", [])
+    # ---------------------------------------------------------
+    # STEP 1: Find the 'Superstore' Workspace
+    # ---------------------------------------------------------
+    logger.info(f"   🔎 Searching for Workspace: '{TARGET_WORKSPACE_NAME}'...")
+    groups_url = "https://api.powerbi.com/v1.0/myorg/groups"
+    g_res = requests.get(groups_url, headers=headers)
     
-    target = next((item for item in reports if item["name"] == "Acme_Corp_Reports"), None)
-    if not target:
-        logger.error("❌ Report not found.")
+    if g_res.status_code != 200:
+        logger.error(f"❌ Failed to list workspaces: {g_res.text}")
+        return "Workspace Error"
+
+    groups = g_res.json().get("value", [])
+    target_group = next((g for g in groups if g["name"] == TARGET_WORKSPACE_NAME), None)
+
+    if not target_group:
+        logger.error(f"❌ Workspace '{TARGET_WORKSPACE_NAME}' NOT FOUND. Check spelling or permissions.")
+        # Log available groups to help debug
+        all_groups = [g["name"] for g in groups]
+        logger.info(f"   (Available Workspaces: {all_groups})")
+        return "Workspace Not Found"
+
+    ws_id = target_group["id"]
+    logger.info(f"   ✅ Found Workspace ID: {ws_id}")
+
+    # ---------------------------------------------------------
+    # STEP 2: Find 'Acme_Corp_Reports' inside Superstore
+    # ---------------------------------------------------------
+    logger.info(f"   📂 Scanning contents of '{TARGET_WORKSPACE_NAME}'...")
+    reports_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/reports"
+    r_res = requests.get(reports_url, headers=headers)
+    reports = r_res.json().get("value", [])
+
+    # We specifically look for Acme first because we know its Table Structure
+    target_report = next((r for r in reports if r["name"] == "Acme_Corp_Reports"), None)
+
+    if not target_report:
+        logger.error("❌ 'Acme_Corp_Reports' not found in Superstore workspace.")
         return "Report Not Found"
 
-    dataset_id = target["datasetId"]
-    
-    # 2. Query Data
-    logger.info(f"   Querying Dataset: {dataset_id}")
+    logger.info(f"   ✅ Found Report: {target_report['name']}")
+    dataset_id = target_report["datasetId"]
+
+    # ---------------------------------------------------------
+    # STEP 3: Query Data (Existing Logic)
+    # ---------------------------------------------------------
     query_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/executeQueries"
     dax = {"queries": [{"query": "EVALUATE Reports"}]}
     
     q_res = requests.post(query_url, headers=headers, json=dax)
+    
     if q_res.status_code != 200:
-        logger.error(f"❌ Query Error: {q_res.text}")
+        logger.error(f"❌ Query Failed: {q_res.text}")
         return "Query Failed"
-        
+    
     try:
         rows = q_res.json()["results"][0]["tables"][0]["rows"]
-        logger.info(f"✅ Found {len(rows)} rows. Sending to Glean...")
+        logger.info(f"   ✅ Extracted {len(rows)} rows.")
     except:
-        logger.error("❌ Parse Error")
+        logger.error("❌ Failed to parse data rows.")
         return "Parse Error"
 
-    # 3. Push to Glean
+    # ---------------------------------------------------------
+    # STEP 4: Push to Glean
+    # ---------------------------------------------------------
     success_count = 0
-    error_count = 0
-
     for row in rows:
         r_id = row.get("Reports[Column1]") or row.get("Column1")
         r_title = row.get("Reports[Column2]") or row.get("Column2")
         r_content = row.get("Reports[Column3]") or row.get("Column3")
-        r_author = row.get("Reports[Column4]") or row.get("Column4")
         r_access = row.get("Reports[Column5]") or row.get("Column5")
 
-        if r_id == "id" or not r_id: continue
+        if not r_id: continue
 
-        # --- FIX: URL ENCODING ---
-        # We manually encode the filter part to handle spaces safely
+        # Safe URL Encode
         raw_filter = f"Reports/Column1 eq '{r_id}'"
         encoded_filter = quote(raw_filter) 
-        final_url = f"{target['webUrl']}?filter={encoded_filter}"
+        final_url = f"{target_report['webUrl']}?filter={encoded_filter}"
 
         payload = {
             "document": {
@@ -110,9 +145,8 @@ def sync_powerbi_to_glean():
                 "viewURL": final_url,
                 "body": {
                     "mimeType": "text/plain",
-                    "textContent": f"Content: {r_content}\n\nAccess Level: {r_access}"
+                    "textContent": f"Content: {r_content}"
                 },
-                "author": {"email": r_author},
                 "permissions": {"allowAnonymousAccess": True}
             }
         }
@@ -122,16 +156,10 @@ def sync_powerbi_to_glean():
             headers={"Authorization": f"Bearer {GLEAN_API_TOKEN}"}, 
             json=payload
         )
-        
-        if res.status_code != 200:
-            error_count += 1
-            if error_count == 1:
-                logger.error(f"❌ GLEAN REJECTED DATA! Status: {res.status_code}")
-                logger.error(f"❌ REASON: {res.text}")
-        else:
+        if res.status_code == 200:
             success_count += 1
-            
-    logger.info(f"📊 Summary: {success_count} Succeeded, {error_count} Failed.")
+
+    logger.info(f"📊 Sync Complete. {success_count} items pushed from Superstore.")
     return "Done"
 
 scheduler = BackgroundScheduler()
@@ -139,7 +167,7 @@ scheduler.add_job(sync_powerbi_to_glean, 'interval', minutes=30)
 scheduler.start()
 
 @app.route('/')
-def home(): return "Glean Connector Running"
+def home(): return "Glean Superstore Connector Running"
 
 @app.route('/sync')
 def manual_sync():
