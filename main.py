@@ -2,6 +2,7 @@ import os
 import requests
 import msal
 import logging
+from urllib.parse import quote  # <--- NEW IMPORT
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -12,8 +13,7 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 TENANT_ID = os.getenv("TENANT_ID")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN") 
 GLEAN_API_TOKEN = os.getenv("GLEAN_API_TOKEN")
-
-GLEAN_URL = "https://app.glean.com"
+GLEAN_URL = os.getenv("GLEAN_URL") # Ensures we use the correct oida-be URL
 DATASOURCE = "powerbiconductor" 
 
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +44,10 @@ def get_access_token():
 def sync_powerbi_to_glean():
     logger.info("⏳ Starting Sync Job...")
     
+    if not GLEAN_URL:
+        logger.error("❌ GLEAN_URL is missing! Check Render Environment Variables.")
+        return "Config Error"
+
     token = get_access_token()
     if not token: return "Auth Failed"
 
@@ -79,7 +83,7 @@ def sync_powerbi_to_glean():
         logger.error("❌ Parse Error")
         return "Parse Error"
 
-    # 3. Push to Glean (With Error Checking)
+    # 3. Push to Glean
     success_count = 0
     error_count = 0
 
@@ -92,12 +96,18 @@ def sync_powerbi_to_glean():
 
         if r_id == "id" or not r_id: continue
 
+        # --- FIX: URL ENCODING ---
+        # We manually encode the filter part to handle spaces safely
+        raw_filter = f"Reports/Column1 eq '{r_id}'"
+        encoded_filter = quote(raw_filter) 
+        final_url = f"{target['webUrl']}?filter={encoded_filter}"
+
         payload = {
             "document": {
                 "datasource": DATASOURCE,
                 "id": r_id,
                 "title": r_title,
-                "viewURL": f"{target['webUrl']}?filter=Reports/Column1 eq '{r_id}'",
+                "viewURL": final_url,
                 "body": {
                     "mimeType": "text/plain",
                     "textContent": f"Content: {r_content}\n\nAccess Level: {r_access}"
@@ -107,7 +117,6 @@ def sync_powerbi_to_glean():
             }
         }
         
-        # --- NEW: Check the response! ---
         res = requests.post(
             f"{GLEAN_URL}/api/index/v1/indexdocument", 
             headers={"Authorization": f"Bearer {GLEAN_API_TOKEN}"}, 
@@ -116,7 +125,6 @@ def sync_powerbi_to_glean():
         
         if res.status_code != 200:
             error_count += 1
-            # Only print the first error to avoid flooding logs
             if error_count == 1:
                 logger.error(f"❌ GLEAN REJECTED DATA! Status: {res.status_code}")
                 logger.error(f"❌ REASON: {res.text}")

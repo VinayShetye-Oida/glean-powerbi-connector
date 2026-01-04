@@ -1,0 +1,6 @@
+flask
+apscheduler
+msal
+requests
+pandas
+gunicorn
