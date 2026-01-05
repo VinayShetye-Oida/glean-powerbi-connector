@@ -10,13 +10,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # CONFIGURATION
 # ==========================================
 CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")  # <--- NEW: Read the secret
 TENANT_ID = os.getenv("TENANT_ID")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN") 
 GLEAN_API_TOKEN = os.getenv("GLEAN_API_TOKEN")
 GLEAN_URL = os.getenv("GLEAN_URL")
 DATASOURCE = "powerbiconductor" 
 
-# TARGET WORKSPACE NAME (The one from your screenshot)
+# TARGET WORKSPACE NAME
 TARGET_WORKSPACE_NAME = "Superstore"
 
 logging.basicConfig(level=logging.INFO)
@@ -29,10 +30,19 @@ def get_access_token():
         logger.error("❌ REFRESH_TOKEN is missing!")
         return None
     
-    authority = f"https://login.microsoftonline.com/{TENANT_ID}"
-    client = msal.PublicClientApplication(CLIENT_ID, authority=authority)
+    if not CLIENT_SECRET:
+        logger.error("❌ CLIENT_SECRET is missing! Add it to Render Environment Variables.")
+        return None
     
-    # UPDATED SCOPES: Added Group.Read.All to access Shared Workspaces
+    authority = f"https://login.microsoftonline.com/{TENANT_ID}"
+    
+    # UPDATE: Use ConfidentialClientApplication (Required for Group permissions)
+    client = msal.ConfidentialClientApplication(
+        CLIENT_ID, 
+        authority=authority,
+        client_credential=CLIENT_SECRET
+    )
+    
     result = client.acquire_token_by_refresh_token(
         REFRESH_TOKEN, 
         scopes=[
@@ -75,7 +85,6 @@ def sync_powerbi_to_glean():
 
     if not target_group:
         logger.error(f"❌ Workspace '{TARGET_WORKSPACE_NAME}' NOT FOUND. Check spelling or permissions.")
-        # Log available groups to help debug
         all_groups = [g["name"] for g in groups]
         logger.info(f"   (Available Workspaces: {all_groups})")
         return "Workspace Not Found"
@@ -91,7 +100,6 @@ def sync_powerbi_to_glean():
     r_res = requests.get(reports_url, headers=headers)
     reports = r_res.json().get("value", [])
 
-    # We specifically look for Acme first because we know its Table Structure
     target_report = next((r for r in reports if r["name"] == "Acme_Corp_Reports"), None)
 
     if not target_report:
@@ -102,7 +110,7 @@ def sync_powerbi_to_glean():
     dataset_id = target_report["datasetId"]
 
     # ---------------------------------------------------------
-    # STEP 3: Query Data (Existing Logic)
+    # STEP 3: Query Data
     # ---------------------------------------------------------
     query_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/executeQueries"
     dax = {"queries": [{"query": "EVALUATE Reports"}]}
@@ -128,11 +136,9 @@ def sync_powerbi_to_glean():
         r_id = row.get("Reports[Column1]") or row.get("Column1")
         r_title = row.get("Reports[Column2]") or row.get("Column2")
         r_content = row.get("Reports[Column3]") or row.get("Column3")
-        r_access = row.get("Reports[Column5]") or row.get("Column5")
-
+        
         if not r_id: continue
 
-        # Safe URL Encode
         raw_filter = f"Reports/Column1 eq '{r_id}'"
         encoded_filter = quote(raw_filter) 
         final_url = f"{target_report['webUrl']}?filter={encoded_filter}"
