@@ -2,40 +2,52 @@ import msal
 import os
 
 # ==========================================
-# CONFIGURATION (SAFE FOR GITHUB)
+# 🔐 CONFIGURATION (Env Vars)
 # ==========================================
-# When running locally, REPLACE these values temporarily.
-# DO NOT COMMIT REAL SECRETS TO GIT.
-CLIENT_ID = os.getenv("CLIENT_ID") 
-CLIENT_SECRET = os.getenv("CLIENT_SECRET") 
-TENANT_ID = os.getenv("TENANT_ID") 
+# Run this locally by exporting these variables first, 
+# or temporarily hardcoding them for a one-time run.
+CLIENT_ID = os.getenv("CLIENT_ID")
+TENANT_ID = os.getenv("TENANT_ID")
 
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+# Requesting Admin Scanner permissions explicitly
 SCOPES = [
+    "https://analysis.windows.net/powerbi/api/Tenant.Read.All",
     "https://analysis.windows.net/powerbi/api/Report.Read.All",
-    "https://analysis.windows.net/powerbi/api/Dataset.Read.All",
-    "https://analysis.windows.net/powerbi/api/Group.Read.All" 
+    "https://analysis.windows.net/powerbi/api/Group.Read.All",
+    "https://analysis.windows.net/powerbi/api/Dataset.Read.All"
 ]
 
-app = msal.ConfidentialClientApplication(
-    CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET
-)
+def get_new_refresh_token():
+    if not CLIENT_ID or not TENANT_ID:
+        print("❌ Error: Please set CLIENT_ID and TENANT_ID environment variables.")
+        return
 
-# 1. Generate Login URL
-auth_url = app.get_authorization_request_url(SCOPES)
-print("\n1. CLICK THIS URL to Log In and Authorize the NEW permissions:")
-print(auth_url)
+    # Use PublicClient for Device Flow (No Client Secret needed)
+    app = msal.PublicClientApplication(
+        CLIENT_ID, 
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}"
+    )
 
-# 2. Get Code
-code = input("\n2. Paste the 'code' from the URL here: ")
+    flow = app.initiate_device_flow(scopes=SCOPES)
+    if "user_code" not in flow:
+        print("❌ Failed to create device flow.")
+        return
 
-# 3. Exchange for Token
-try:
-    result = app.acquire_token_by_authorization_code(code, scopes=SCOPES)
+    print(f"\n⚠️ ACTION REQUIRED:")
+    print(f"1. Go to: {flow['verification_uri']}")
+    print(f"2. Enter Code: {flow['user_code']}")
+    print("3. Sign in with your Admin account\n")
+
+    result = app.acquire_token_by_device_flow(flow)
+
     if "refresh_token" in result:
-        print("\n✅ NEW REFRESH TOKEN (Copy this):")
+        print("\n✅ NEW REFRESH TOKEN GENERATED:")
+        print("---------------------------------------------------")
         print(result["refresh_token"])
+        print("---------------------------------------------------")
+        print("👉 Copy this token into your Render Environment Variables as 'REFRESH_TOKEN'")
     else:
-        print("\n❌ Error:", result.get("error_description"))
-except Exception as e:
-    print(f"\n❌ Exception: {e}")
+        print(f"❌ Error: {result.get('error_description')}")
+
+if __name__ == "__main__":
+    get_new_refresh_token()
