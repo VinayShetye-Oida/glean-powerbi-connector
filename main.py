@@ -35,7 +35,7 @@ def get_access_token():
         CLIENT_ID, authority=authority, client_credential=CLIENT_SECRET
     )
     
-    # UPDATE: Service Principals must use the .default scope
+    # Use .default scope for Service Principal
     result = client.acquire_token_by_refresh_token(
         REFRESH_TOKEN, 
         scopes=["https://analysis.windows.net/powerbi/api/.default"]
@@ -48,7 +48,7 @@ def sync_powerbi_to_glean():
     if not token: return "Auth Failed"
     headers = {"Authorization": f"Bearer {token}"}
     
-    # 1. Find Workspace
+    # 1. Find Workspace (To discover reports)
     groups_url = "https://api.powerbi.com/v1.0/myorg/groups"
     groups = requests.get(groups_url, headers=headers).json().get("value", [])
     target_group = next((g for g in groups if g["name"] == TARGET_WORKSPACE_NAME), None)
@@ -73,9 +73,9 @@ def sync_powerbi_to_glean():
         web_url = report["webUrl"]
         logger.info(f"      👉 Processing Report: {report_name}")
 
-        # 3. DISCOVERY: Get Tables in this Dataset (UPDATED URL)
-        # We now include 'groups/{ws_id}' to ensure we look in the right place
-        tables_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/datasets/{dataset_id}/tables"
+        # 3. DISCOVERY: Get Tables (Reverted to global endpoint)
+        # Note: We removed 'groups/{ws_id}' here because it caused 404s
+        tables_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/tables"
         t_res = requests.get(tables_url, headers=headers)
         
         if t_res.status_code != 200:
@@ -90,8 +90,8 @@ def sync_powerbi_to_glean():
 
             logger.info(f"         📊 Found Table: '{table_name}'. Querying...")
 
-            # 4. DYNAMIC QUERY (UPDATED URL)
-            query_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/datasets/{dataset_id}/executeQueries"
+            # 4. DYNAMIC QUERY (Reverted to global endpoint)
+            query_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/executeQueries"
             
             dax = {"queries": [{"query": f"EVALUATE TOPN(50, '{table_name}')"}]}
             
@@ -112,11 +112,7 @@ def sync_powerbi_to_glean():
                 values = list(row.values())
                 if not values: continue
                 
-                # Dynamic Mapping:
-                # Col 0 -> ID
-                # Col 1 -> Title (or Report Name)
-                # All Cols -> Content
-                
+                # Dynamic Mapping
                 r_id = str(values[0])
                 r_title = str(values[1]) if len(values) > 1 else f"{report_name} - {table_name}"
                 r_content = " | ".join([str(v) for v in values])
