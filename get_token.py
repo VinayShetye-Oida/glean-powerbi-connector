@@ -2,47 +2,40 @@ import msal
 import os
 
 # ==========================================
-# CONFIGURATION (SECRETS REMOVED)
+# CONFIGURATION (SAFE FOR GITHUB)
 # ==========================================
-# If running locally, you must set these Env Vars or temporarily paste them, 
-# but DO NOT save/commit them to GitHub.
-CLIENT_ID = os.getenv("CLIENT_ID")
+# When running locally, REPLACE these values temporarily.
+# DO NOT COMMIT REAL SECRETS TO GIT.
+CLIENT_ID = os.getenv("CLIENT_ID") 
+CLIENT_SECRET = os.getenv("CLIENT_SECRET") 
 TENANT_ID = os.getenv("TENANT_ID") 
 
-if not CLIENT_ID or not TENANT_ID:
-    print("⚠️  MISSING CONFIG: Please set CLIENT_ID and TENANT_ID environment variables.")
-    # For local testing ONLY, you can uncomment and paste below, but undo before pushing:
-    # CLIENT_ID = "paste_your_id_here"
-    # TENANT_ID = "paste_your_tenant_here"
-
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPES = [
+    "https://analysis.windows.net/powerbi/api/Report.Read.All",
+    "https://analysis.windows.net/powerbi/api/Dataset.Read.All",
+    "https://analysis.windows.net/powerbi/api/Group.Read.All" 
+]
 
-# We removed "offline_access" from scopes to avoid the "Duplicate" error
-SCOPES = ["https://analysis.windows.net/powerbi/api/Report.Read.All", 
-          "https://analysis.windows.net/powerbi/api/Dataset.Read.All"]
+app = msal.ConfidentialClientApplication(
+    CLIENT_ID, authority=AUTHORITY, client_credential=CLIENT_SECRET
+)
 
-app = msal.PublicClientApplication(CLIENT_ID, authority=AUTHORITY)
+# 1. Generate Login URL
+auth_url = app.get_authorization_request_url(SCOPES)
+print("\n1. CLICK THIS URL to Log In and Authorize the NEW permissions:")
+print(auth_url)
 
-# Start the login flow
-flow = app.initiate_device_flow(scopes=SCOPES)
-if "user_code" not in flow:
-    print("❌ Failed to create flow. Check your Client ID / Tenant ID.")
-    exit(1)
+# 2. Get Code
+code = input("\n2. Paste the 'code' from the URL here: ")
 
-print(f"\n******************************************************")
-print(f"ACTION REQUIRED:")
-print(f"1. Click: {flow['verification_uri']}")
-print(f"2. Enter Code: {flow['user_code']}")
-print(f"******************************************************\n")
-
-# Wait for you to login
-result = app.acquire_token_by_device_flow(flow)
-
-if "refresh_token" in result:
-    print("\n✅ SUCCESS! COPY THE TOKEN BELOW (IT IS VERY LONG):")
-    print("---------------------------------------------------")
-    print(result["refresh_token"])
-    print("---------------------------------------------------")
-else:
-    print("❌ Failed.")
-    print(result.get("error_description"))
+# 3. Exchange for Token
+try:
+    result = app.acquire_token_by_authorization_code(code, scopes=SCOPES)
+    if "refresh_token" in result:
+        print("\n✅ NEW REFRESH TOKEN (Copy this):")
+        print(result["refresh_token"])
+    else:
+        print("\n❌ Error:", result.get("error_description"))
+except Exception as e:
+    print(f"\n❌ Exception: {e}")
