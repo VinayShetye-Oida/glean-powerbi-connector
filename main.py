@@ -35,13 +35,10 @@ def get_access_token():
         CLIENT_ID, authority=authority, client_credential=CLIENT_SECRET
     )
     
+    # UPDATE: Service Principals must use the .default scope
     result = client.acquire_token_by_refresh_token(
         REFRESH_TOKEN, 
-        scopes=[
-            "https://analysis.windows.net/powerbi/api/Report.Read.All", 
-            "https://analysis.windows.net/powerbi/api/Dataset.Read.All",
-            "https://analysis.windows.net/powerbi/api/Group.Read.All" 
-        ]
+        scopes=["https://analysis.windows.net/powerbi/api/.default"]
     )
     return result.get("access_token")
 
