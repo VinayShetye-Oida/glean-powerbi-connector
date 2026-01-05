@@ -4,6 +4,7 @@ import msal
 import logging
 import time
 import json
+import threading # <--- NEW IMPORT
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -11,7 +12,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # 🔐 CONFIGURATION (Env Vars for Render)
 # ==========================================
 CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET") # <--- Added this back
+CLIENT_SECRET = os.getenv("CLIENT_SECRET") 
 TENANT_ID = os.getenv("TENANT_ID")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN") 
 GLEAN_API_TOKEN = os.getenv("GLEAN_API_TOKEN")
@@ -33,8 +34,7 @@ def get_access_token():
         logger.error("❌ CLIENT_SECRET is missing from Environment Variables.")
         return None
 
-    # 🔥 FIX: Changed back to ConfidentialClientApplication to satisfy Azure's security requirement
-    # Even though the token came from Device Flow, the App itself requires the Secret.
+    # Using ConfidentialClientApplication (required for Azure Web Apps)
     client = msal.ConfidentialClientApplication(
         CLIENT_ID, 
         authority=f"https://login.microsoftonline.com/{TENANT_ID}",
@@ -164,8 +164,10 @@ def home():
 
 @app.route('/sync')
 def manual_sync():
-    run_sync_job()
-    return jsonify({"status": "Sync Job Triggered. Check Logs."})
+    # 🔥 FIX: Run in Background Thread so Render doesn't timeout!
+    thread = threading.Thread(target=run_sync_job)
+    thread.start()
+    return jsonify({"status": "Sync Job Triggered in Background. Watch the Render Logs!"})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
