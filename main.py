@@ -17,7 +17,6 @@ GLEAN_API_TOKEN = os.getenv("GLEAN_API_TOKEN")
 GLEAN_URL = os.getenv("GLEAN_URL")
 DATASOURCE = "powerbiconductor" 
 
-# The workspace to scan
 TARGET_WORKSPACE_NAME = "Superstore"
 
 logging.basicConfig(level=logging.INFO)
@@ -27,15 +26,13 @@ app = Flask(__name__)
 
 def get_access_token():
     if not REFRESH_TOKEN or not CLIENT_SECRET:
-        logger.error("❌ Credentials missing! Check Environment Variables.")
+        logger.error("❌ Credentials missing!")
         return None
     
     authority = f"https://login.microsoftonline.com/{TENANT_ID}"
     client = msal.ConfidentialClientApplication(
         CLIENT_ID, authority=authority, client_credential=CLIENT_SECRET
     )
-    
-    # SERVICE PRINCIPALS MUST USE .default SCOPE
     result = client.acquire_token_by_refresh_token(
         REFRESH_TOKEN, 
         scopes=["https://analysis.windows.net/powerbi/api/.default"]
@@ -43,27 +40,25 @@ def get_access_token():
     return result.get("access_token")
 
 def sync_powerbi_to_glean():
-    logger.info("🤖 Starting Smart Sync Job...")
+    logger.info("🤖 Starting Smart DAX Sync...")
     token = get_access_token()
     if not token: return "Auth Failed"
     headers = {"Authorization": f"Bearer {token}"}
     
     # 1. Find Workspace
-    groups_url = "https://api.powerbi.com/v1.0/myorg/groups"
-    groups = requests.get(groups_url, headers=headers).json().get("value", [])
+    groups = requests.get("https://api.powerbi.com/v1.0/myorg/groups", headers=headers).json().get("value", [])
     target_group = next((g for g in groups if g["name"] == TARGET_WORKSPACE_NAME), None)
 
     if not target_group:
-        logger.error(f"❌ Workspace '{TARGET_WORKSPACE_NAME}' not found. (Check 'Manage Access' in Power BI)")
+        logger.error(f"❌ Workspace '{TARGET_WORKSPACE_NAME}' not found.")
         return "Workspace Missing"
 
     ws_id = target_group["id"]
     logger.info(f"   📂 Scanning Workspace: {TARGET_WORKSPACE_NAME} ({ws_id})")
 
-    # 2. Get ALL Reports in Workspace
-    reports_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/reports"
-    reports = requests.get(reports_url, headers=headers).json().get("value", [])
-    logger.info(f"   🔎 Found {len(reports)} reports. Beginning analysis...")
+    # 2. Get Reports
+    reports = requests.get(f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/reports", headers=headers).json().get("value", [])
+    logger.info(f"   🔎 Found {len(reports)} reports.")
 
     total_indexed = 0
 
@@ -71,51 +66,61 @@ def sync_powerbi_to_glean():
         report_name = report["name"]
         dataset_id = report["datasetId"]
         web_url = report["webUrl"]
-        logger.info(f"      👉 Processing Report: {report_name}")
-
-        # 3. DISCOVERY: Get Tables (Using GROUP Path - REQUIRED for Members)
-        tables_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/datasets/{dataset_id}/tables"
-        t_res = requests.get(tables_url, headers=headers)
         
-        if t_res.status_code != 200:
-            logger.warning(f"         ⚠️ Metadata Error {t_res.status_code}. Skipping.")
+        # Check if dataset is in a different workspace (Shared Dataset)
+        # If 'datasetWorkspaceId' is present, use it. Otherwise use current ws_id.
+        ds_ws_id = report.get("datasetWorkspaceId", ws_id)
+        
+        logger.info(f"      👉 Report: {report_name} (Dataset: {dataset_id})")
+
+        # 3. SMART DISCOVERY VIA DAX (The "Side Door")
+        # We query the DMV (Dynamic Management View) to list tables.
+        discovery_query = "EVALUATE SELECTCOLUMNS(INFO.TABLES(), \"Table\", [Name])"
+        
+        query_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ds_ws_id}/datasets/{dataset_id}/executeQueries"
+        
+        dax_payload = {"queries": [{"query": discovery_query}]}
+        meta_res = requests.post(query_url, headers=headers, json=dax_payload)
+        
+        if meta_res.status_code != 200:
+            logger.warning(f"         ⚠️ Could not discover tables (Error {meta_res.status_code}). Skipping.")
             continue
             
-        tables = t_res.json().get("value", [])
-        
-        for table in tables:
-            table_name = table["name"]
-            if table_name.startswith("DateTableTemplate"): continue 
+        try:
+            # Parse the table names from the DAX result
+            found_tables = [row["[Table]"] for row in meta_res.json()["results"][0]["tables"][0]["rows"]]
+        except:
+            logger.warning("         ⚠️ Failed to parse table list.")
+            continue
 
-            logger.info(f"         📊 Found Table: '{table_name}'. Querying...")
+        for table_name in found_tables:
+            # Skip hidden system tables
+            if table_name.startswith("Date") or table_name.startswith("LocalDate"): continue
 
-            # 4. DYNAMIC QUERY (Using GROUP Path)
-            query_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/datasets/{dataset_id}/executeQueries"
+            logger.info(f"         📊 Discovered Table: '{table_name}'. Indexing...")
+
+            # 4. FETCH DATA (Dynamic TOPN)
+            data_query = f"EVALUATE TOPN(50, '{table_name}')"
+            q_res = requests.post(query_url, headers=headers, json={"queries": [{"query": data_query}]})
             
-            dax = {"queries": [{"query": f"EVALUATE TOPN(50, '{table_name}')"}]}
-            
-            q_res = requests.post(query_url, headers=headers, json=dax)
-            
-            if q_res.status_code != 200:
-                logger.warning(f"         ⚠️ Query failed for table '{table_name}'.")
-                continue
+            if q_res.status_code != 200: continue
 
             try:
                 rows = q_res.json()["results"][0]["tables"][0]["rows"]
-            except:
-                continue
+            except: continue
 
-            # 5. DYNAMIC INDEXING
+            # 5. INDEX TO GLEAN
             count = 0
             for row in rows:
                 values = list(row.values())
                 if not values: continue
                 
+                # Heuristic: Col 0 = ID, Col 1 = Title, Rest = Body
                 r_id = str(values[0])
                 r_title = str(values[1]) if len(values) > 1 else f"{report_name} - {table_name}"
                 r_content = " | ".join([str(v) for v in values])
 
-                # URL Filter Logic
+                # Construct URL Filter
                 col_key_name = list(row.keys())[0] 
                 clean_col_name = col_key_name.replace("[", "/").replace("]", "")
                 
@@ -141,11 +146,10 @@ def sync_powerbi_to_glean():
                     headers={"Authorization": f"Bearer {GLEAN_API_TOKEN}"}, 
                     json=payload
                 )
-                if res.status_code == 200:
-                    count += 1
+                if res.status_code == 200: count += 1
             
             total_indexed += count
-            logger.info(f"         ✅ Indexed {count} rows from '{table_name}'")
+            logger.info(f"         ✅ Indexed {count} rows.")
 
     logger.info(f"🚀 Sync Complete. Total items indexed: {total_indexed}")
     return "Done"
