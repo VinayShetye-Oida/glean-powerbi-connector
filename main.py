@@ -10,8 +10,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # ==========================================
 # 🔐 CONFIGURATION (Env Vars for Render)
 # ==========================================
-# We use PublicClient because the token was generated via Device Flow (User Context)
 CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET") # <--- Added this back
 TENANT_ID = os.getenv("TENANT_ID")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN") 
 GLEAN_API_TOKEN = os.getenv("GLEAN_API_TOKEN")
@@ -28,11 +28,19 @@ def get_access_token():
     if not REFRESH_TOKEN:
         logger.error("❌ REFRESH_TOKEN is missing from Environment Variables.")
         return None
+    
+    if not CLIENT_SECRET:
+        logger.error("❌ CLIENT_SECRET is missing from Environment Variables.")
+        return None
 
-    # Using PublicClientApplication to match the Admin User Token
-    client = msal.PublicClientApplication(
-        CLIENT_ID, authority=f"https://login.microsoftonline.com/{TENANT_ID}"
+    # 🔥 FIX: Changed back to ConfidentialClientApplication to satisfy Azure's security requirement
+    # Even though the token came from Device Flow, the App itself requires the Secret.
+    client = msal.ConfidentialClientApplication(
+        CLIENT_ID, 
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        client_credential=CLIENT_SECRET
     )
+    
     result = client.acquire_token_by_refresh_token(
         REFRESH_TOKEN, 
         scopes=["https://analysis.windows.net/powerbi/api/Tenant.Read.All", 
