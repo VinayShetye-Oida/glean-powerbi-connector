@@ -76,32 +76,31 @@ def sync_powerbi_to_glean():
         web_url = report["webUrl"]
         logger.info(f"      👉 Processing Report: {report_name}")
 
-        # 3. DISCOVERY: Get Tables in this Dataset
-        tables_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/tables"
+        # 3. DISCOVERY: Get Tables in this Dataset (UPDATED URL)
+        # We now include 'groups/{ws_id}' to ensure we look in the right place
+        tables_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/datasets/{dataset_id}/tables"
         t_res = requests.get(tables_url, headers=headers)
         
         if t_res.status_code != 200:
-            logger.warning(f"         ⚠️ Could not fetch metadata for {report_name}. Skipping.")
+            logger.warning(f"         ⚠️ Could not fetch metadata. Status: {t_res.status_code}. Skipping.")
             continue
             
         tables = t_res.json().get("value", [])
         
         for table in tables:
             table_name = table["name"]
-            # Skip hidden/system tables if any (optional filter)
             if table_name.startswith("DateTableTemplate"): continue 
 
             logger.info(f"         📊 Found Table: '{table_name}'. Querying...")
 
-            # 4. DYNAMIC QUERY
-            query_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/executeQueries"
-            # We query TOP 50 rows from the discovered table name
+            # 4. DYNAMIC QUERY (UPDATED URL)
+            query_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/datasets/{dataset_id}/executeQueries"
+            
             dax = {"queries": [{"query": f"EVALUATE TOPN(50, '{table_name}')"}]}
             
             q_res = requests.post(query_url, headers=headers, json=dax)
             
             if q_res.status_code != 200:
-                # Some tables can't be queried directly, just skip them
                 logger.warning(f"         ⚠️ Query failed for table '{table_name}'.")
                 continue
 
@@ -113,33 +112,20 @@ def sync_powerbi_to_glean():
             # 5. DYNAMIC INDEXING
             count = 0
             for row in rows:
-                # Convert the Row Dictionary to a List of Values
-                # This ignores column names (Column1 vs Region) and just uses position
                 values = list(row.values())
-                
-                # Heuristic: 
-                # Col 0 = ID (Must allow unique lookups)
-                # Col 1 = Title (Something readable)
-                # All Cols = Content body
-                
                 if not values: continue
                 
-                # Use the first column as the ID. 
-                # If it's a number, convert to string.
+                # Dynamic Mapping:
+                # Col 0 -> ID
+                # Col 1 -> Title (or Report Name)
+                # All Cols -> Content
+                
                 r_id = str(values[0])
-                
-                # Use second column as Title, or fallback to Report Name
                 r_title = str(values[1]) if len(values) > 1 else f"{report_name} - {table_name}"
-                
-                # Combine all columns into the search body
                 r_content = " | ".join([str(v) for v in values])
 
-                # URL Logic: We try to filter by the first column name found in the row keys
-                # Get the actual column name from the data (e.g., "Orders[OrderID]")
+                # URL Filter Logic
                 col_key_name = list(row.keys())[0] 
-                # Clean it up for the URL filter (remove table name brackets if needed)
-                # Power BI Filter format: Table/Column eq 'Value'
-                # The API returns keys like "Orders[City]", we need "Orders/City"
                 clean_col_name = col_key_name.replace("[", "/").replace("]", "")
                 
                 raw_filter = f"{clean_col_name} eq '{r_id}'"
@@ -148,7 +134,7 @@ def sync_powerbi_to_glean():
                 payload = {
                     "document": {
                         "datasource": DATASOURCE,
-                        "id": f"{report_name}_{table_name}_{r_id}", # Ensure unique ID across tables
+                        "id": f"{report_name}_{table_name}_{r_id}",
                         "title": r_title,
                         "viewURL": final_url,
                         "body": {
@@ -159,7 +145,6 @@ def sync_powerbi_to_glean():
                     }
                 }
                 
-                # Send to Glean
                 res = requests.post(
                     f"{GLEAN_URL}/api/index/v1/indexdocument", 
                     headers={"Authorization": f"Bearer {GLEAN_API_TOKEN}"}, 
