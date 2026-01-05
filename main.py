@@ -2,21 +2,21 @@ import os
 import requests
 import msal
 import logging
-from urllib.parse import quote
+import time
+import json
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ==========================================
-# CONFIGURATION
+# 🔐 CONFIGURATION (Env Vars for Render)
 # ==========================================
+# We use PublicClient because the token was generated via Device Flow (User Context)
 CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET") 
 TENANT_ID = os.getenv("TENANT_ID")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN") 
 GLEAN_API_TOKEN = os.getenv("GLEAN_API_TOKEN")
-GLEAN_URL = os.getenv("GLEAN_URL")
+GLEAN_URL = os.getenv("GLEAN_URL", "https://oida-be.glean.com")
 DATASOURCE = "powerbiconductor" 
-
 TARGET_WORKSPACE_NAME = "Superstore"
 
 logging.basicConfig(level=logging.INFO)
@@ -25,146 +25,140 @@ logger = logging.getLogger("Connector")
 app = Flask(__name__)
 
 def get_access_token():
-    if not REFRESH_TOKEN or not CLIENT_SECRET:
-        logger.error("❌ Credentials missing!")
+    if not REFRESH_TOKEN:
+        logger.error("❌ REFRESH_TOKEN is missing from Environment Variables.")
         return None
-    
-    authority = f"https://login.microsoftonline.com/{TENANT_ID}"
-    client = msal.ConfidentialClientApplication(
-        CLIENT_ID, authority=authority, client_credential=CLIENT_SECRET
+
+    # Using PublicClientApplication to match the Admin User Token
+    client = msal.PublicClientApplication(
+        CLIENT_ID, authority=f"https://login.microsoftonline.com/{TENANT_ID}"
     )
     result = client.acquire_token_by_refresh_token(
         REFRESH_TOKEN, 
-        scopes=["https://analysis.windows.net/powerbi/api/.default"]
+        scopes=["https://analysis.windows.net/powerbi/api/Tenant.Read.All", 
+                "https://analysis.windows.net/powerbi/api/Report.Read.All", 
+                "https://analysis.windows.net/powerbi/api/Group.Read.All"]
     )
-    return result.get("access_token")
+    if "access_token" in result: return result["access_token"]
+    logger.error(f"❌ Auth Failed: {result.get('error_description')}")
+    return None
 
-def sync_powerbi_to_glean():
-    logger.info("🤖 Starting Smart DAX Sync...")
+def run_sync_job():
+    logger.info("🤖 Starting ADMIN SCANNER Sync Job...")
     token = get_access_token()
-    if not token: return "Auth Failed"
+    if not token: return
     headers = {"Authorization": f"Bearer {token}"}
     
-    # 1. Find Workspace
+    # 1. Find Workspace ID
+    logger.info("   🔎 Searching for Workspace...")
     groups = requests.get("https://api.powerbi.com/v1.0/myorg/groups", headers=headers).json().get("value", [])
     target_group = next((g for g in groups if g["name"] == TARGET_WORKSPACE_NAME), None)
-
+    
     if not target_group:
         logger.error(f"❌ Workspace '{TARGET_WORKSPACE_NAME}' not found.")
-        return "Workspace Missing"
-
+        return
+        
     ws_id = target_group["id"]
-    logger.info(f"   📂 Scanning Workspace: {TARGET_WORKSPACE_NAME} ({ws_id})")
+    logger.info(f"   📂 Found Workspace: {ws_id}")
 
-    # 2. Get Reports
-    reports = requests.get(f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/reports", headers=headers).json().get("value", [])
-    logger.info(f"   🔎 Found {len(reports)} reports.")
+    # 2. INITIATE ADMIN SCAN (The Solution)
+    scan_url = "https://api.powerbi.com/v1.0/myorg/admin/workspaces/getInfo?lineage=True&datasourceDetails=True&datasetSchema=True"
+    payload = {"workspaces": [ws_id]}
+    
+    logger.info("   🛰️ Initiating Metadata Scan...")
+    scan_res = requests.post(scan_url, headers=headers, json=payload)
+    
+    if scan_res.status_code != 202:
+        logger.error(f"   ❌ Scan Initiation Failed: {scan_res.status_code} - {scan_res.text}")
+        return
 
+    scan_id = scan_res.json()["id"]
+    logger.info(f"   ⏳ Scan ID: {scan_id}. Waiting for results...")
+
+    # 3. POLL FOR RESULTS
+    while True:
+        status_res = requests.get(f"https://api.powerbi.com/v1.0/myorg/admin/workspaces/scanStatus/{scan_id}", headers=headers)
+        status = status_res.json().get("status")
+        
+        if status == "Succeeded": break
+        if status == "Failed":
+            logger.error("   ❌ Scan Failed.")
+            return
+        time.sleep(2)
+
+    # 4. PROCESS RESULTS
+    result_res = requests.get(f"https://api.powerbi.com/v1.0/myorg/admin/workspaces/scanResult/{scan_id}", headers=headers)
+    scan_data = result_res.json()
+    
     total_indexed = 0
-
-    for report in reports:
-        report_name = report["name"]
-        dataset_id = report["datasetId"]
-        web_url = report["webUrl"]
+    if "workspaces" in scan_data:
+        workspace_data = scan_data["workspaces"][0]
         
-        # Check if dataset is in a different workspace (Shared Dataset)
-        # If 'datasetWorkspaceId' is present, use it. Otherwise use current ws_id.
-        ds_ws_id = report.get("datasetWorkspaceId", ws_id)
-        
-        logger.info(f"      👉 Report: {report_name} (Dataset: {dataset_id})")
-
-        # 3. SMART DISCOVERY VIA DAX (The "Side Door")
-        # We query the DMV (Dynamic Management View) to list tables.
-        discovery_query = "EVALUATE SELECTCOLUMNS(INFO.TABLES(), \"Table\", [Name])"
-        
-        query_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ds_ws_id}/datasets/{dataset_id}/executeQueries"
-        
-        dax_payload = {"queries": [{"query": discovery_query}]}
-        meta_res = requests.post(query_url, headers=headers, json=dax_payload)
-        
-        if meta_res.status_code != 200:
-            logger.warning(f"         ⚠️ Could not discover tables (Error {meta_res.status_code}). Skipping.")
-            continue
+        for dataset in workspace_data.get("datasets", []):
+            ds_name = dataset.get("name")
+            ds_id = dataset.get("id")
             
-        try:
-            # Parse the table names from the DAX result
-            found_tables = [row["[Table]"] for row in meta_res.json()["results"][0]["tables"][0]["rows"]]
-        except:
-            logger.warning("         ⚠️ Failed to parse table list.")
-            continue
+            # Create valid View URL for Glean
+            valid_view_url = f"https://app.powerbi.com/groups/{ws_id}/datasets/{ds_id}"
 
-        for table_name in found_tables:
-            # Skip hidden system tables
-            if table_name.startswith("Date") or table_name.startswith("LocalDate"): continue
+            if "tables" in dataset:
+                for table in dataset["tables"]:
+                    table_name = table["name"]
+                    if table_name.startswith("Date") or table_name.startswith("LocalDate") or table_name.startswith("RowNumber"): continue
+                    
+                    # Get Data
+                    query_url = f"https://api.powerbi.com/v1.0/myorg/groups/{ws_id}/datasets/{ds_id}/executeQueries"
+                    dax = {"queries": [{"query": f"EVALUATE TOPN(50, '{table_name}')"}]}
+                    
+                    try:
+                        res = requests.post(query_url, headers=headers, json=dax)
+                        if res.status_code == 200:
+                            rows = res.json()["results"][0]["tables"][0]["rows"]
+                            if rows:
+                                logger.info(f"      ✅ Extracted '{table_name}': {len(rows)} rows.")
+                                
+                                count = 0
+                                for row in rows:
+                                    vals = list(row.values())
+                                    if not vals: continue
+                                    r_id = str(vals[0])
+                                    r_title = f"{ds_name} - {table_name}"
+                                    r_content = " | ".join([str(v) for v in vals])
+                                    
+                                    payload = {
+                                        "document": {
+                                            "datasource": DATASOURCE,
+                                            "id": f"{ds_name}_{table_name}_{r_id}",
+                                            "title": r_title,
+                                            "viewURL": valid_view_url,
+                                            "body": {"mimeType": "text/plain", "textContent": r_content},
+                                            "permissions": {"allowAnonymousAccess": True}
+                                        }
+                                    }
+                                    # Push to Glean
+                                    g_res = requests.post(f"{GLEAN_URL}/api/index/v1/indexdocument", headers={"Authorization": f"Bearer {GLEAN_API_TOKEN}"}, json=payload)
+                                    if g_res.status_code == 200: count += 1
+                                
+                                total_indexed += count
+                    except Exception as e:
+                        logger.error(f"      ⚠️ Error processing table {table_name}: {e}")
 
-            logger.info(f"         📊 Discovered Table: '{table_name}'. Indexing...")
+    logger.info(f"🚀 SYNC COMPLETE. Total indexed: {total_indexed}")
 
-            # 4. FETCH DATA (Dynamic TOPN)
-            data_query = f"EVALUATE TOPN(50, '{table_name}')"
-            q_res = requests.post(query_url, headers=headers, json={"queries": [{"query": data_query}]})
-            
-            if q_res.status_code != 200: continue
-
-            try:
-                rows = q_res.json()["results"][0]["tables"][0]["rows"]
-            except: continue
-
-            # 5. INDEX TO GLEAN
-            count = 0
-            for row in rows:
-                values = list(row.values())
-                if not values: continue
-                
-                # Heuristic: Col 0 = ID, Col 1 = Title, Rest = Body
-                r_id = str(values[0])
-                r_title = str(values[1]) if len(values) > 1 else f"{report_name} - {table_name}"
-                r_content = " | ".join([str(v) for v in values])
-
-                # Construct URL Filter
-                col_key_name = list(row.keys())[0] 
-                clean_col_name = col_key_name.replace("[", "/").replace("]", "")
-                
-                raw_filter = f"{clean_col_name} eq '{r_id}'"
-                final_url = f"{web_url}?filter={quote(raw_filter)}"
-
-                payload = {
-                    "document": {
-                        "datasource": DATASOURCE,
-                        "id": f"{report_name}_{table_name}_{r_id}",
-                        "title": r_title,
-                        "viewURL": final_url,
-                        "body": {
-                            "mimeType": "text/plain",
-                            "textContent": f"Source: {report_name} / {table_name}\nData: {r_content}"
-                        },
-                        "permissions": {"allowAnonymousAccess": True}
-                    }
-                }
-                
-                res = requests.post(
-                    f"{GLEAN_URL}/api/index/v1/indexdocument", 
-                    headers={"Authorization": f"Bearer {GLEAN_API_TOKEN}"}, 
-                    json=payload
-                )
-                if res.status_code == 200: count += 1
-            
-            total_indexed += count
-            logger.info(f"         ✅ Indexed {count} rows.")
-
-    logger.info(f"🚀 Sync Complete. Total items indexed: {total_indexed}")
-    return "Done"
-
+# Schedule the job every 60 minutes
 scheduler = BackgroundScheduler()
-scheduler.add_job(sync_powerbi_to_glean, 'interval', minutes=30)
+scheduler.add_job(run_sync_job, 'interval', minutes=60)
 scheduler.start()
 
 @app.route('/')
-def home(): return "Glean Smart Connector Running"
+def home():
+    return "Glean PowerBI Connector is RUNNING (Admin Scanner Mode)"
 
 @app.route('/sync')
 def manual_sync():
-    sync_powerbi_to_glean()
-    return jsonify({"status": "Check Logs"})
+    run_sync_job()
+    return jsonify({"status": "Sync Job Triggered. Check Logs."})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
