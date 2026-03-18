@@ -29,16 +29,11 @@ def get_access_token():
     if not REFRESH_TOKEN:
         logger.error("❌ REFRESH_TOKEN is missing from Environment Variables.")
         return None
-    
-    if not CLIENT_SECRET:
-        logger.error("❌ CLIENT_SECRET is missing from Environment Variables.")
-        return None
 
-    # Using ConfidentialClientApplication (required for Azure Web Apps)
-    client = msal.ConfidentialClientApplication(
+    # Use PublicClientApplication to match Azure AD settings
+    client = msal.PublicClientApplication(
         CLIENT_ID, 
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
-        client_credential=CLIENT_SECRET
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}"
     )
     
     result = client.acquire_token_by_refresh_token(
@@ -47,6 +42,7 @@ def get_access_token():
                 "https://analysis.windows.net/powerbi/api/Report.Read.All", 
                 "https://analysis.windows.net/powerbi/api/Group.Read.All"]
     )
+    
     if "access_token" in result: return result["access_token"]
     logger.error(f"❌ Auth Failed: {result.get('error_description')}")
     return None
