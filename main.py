@@ -4,7 +4,7 @@ import msal
 import logging
 import time
 import json
-import threading # <--- NEW IMPORT
+import threading
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -18,7 +18,9 @@ REFRESH_TOKEN = os.getenv("REFRESH_TOKEN")
 GLEAN_API_TOKEN = os.getenv("GLEAN_API_TOKEN")
 GLEAN_URL = os.getenv("GLEAN_URL", "https://oida-be.glean.com")
 DATASOURCE = "powerbiconductor" 
-TARGET_WORKSPACE_NAME = "Superstore"
+
+# 🔥 UPDATED: Now a list of multiple workspaces
+TARGET_WORKSPACES = ["Superstore", "Demos"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Connector")
@@ -53,21 +55,22 @@ def run_sync_job():
     if not token: return
     headers = {"Authorization": f"Bearer {token}"}
     
-    # 1. Find Workspace ID
-    logger.info("   🔎 Searching for Workspace...")
+    # 1. Find Workspace IDs for all targets
+    logger.info(f"   🔎 Searching for Workspaces: {TARGET_WORKSPACES}")
     groups = requests.get("https://api.powerbi.com/v1.0/myorg/groups", headers=headers).json().get("value", [])
-    target_group = next((g for g in groups if g["name"] == TARGET_WORKSPACE_NAME), None)
     
-    if not target_group:
-        logger.error(f"❌ Workspace '{TARGET_WORKSPACE_NAME}' not found.")
+    # Collect the IDs of any workspace that matches our target list
+    ws_ids = [g["id"] for g in groups if g["name"] in TARGET_WORKSPACES]
+    
+    if not ws_ids:
+        logger.error(f"❌ None of the target workspaces were found.")
         return
         
-    ws_id = target_group["id"]
-    logger.info(f"   📂 Found Workspace: {ws_id}")
+    logger.info(f"   📂 Found {len(ws_ids)} matching Workspaces. IDs: {ws_ids}")
 
-    # 2. INITIATE ADMIN SCAN (The Solution)
+    # 2. INITIATE BULK ADMIN SCAN
     scan_url = "https://api.powerbi.com/v1.0/myorg/admin/workspaces/getInfo?lineage=True&datasourceDetails=True&datasetSchema=True"
-    payload = {"workspaces": [ws_id]}
+    payload = {"workspaces": ws_ids}
     
     logger.info("   🛰️ Initiating Metadata Scan...")
     scan_res = requests.post(scan_url, headers=headers, json=payload)
@@ -95,8 +98,12 @@ def run_sync_job():
     scan_data = result_res.json()
     
     total_indexed = 0
-    if "workspaces" in scan_data:
-        workspace_data = scan_data["workspaces"][0]
+    
+    # Loop through ALL returned workspaces
+    for workspace_data in scan_data.get("workspaces", []):
+        ws_name = workspace_data.get("name")
+        ws_id = workspace_data.get("id")
+        logger.info(f"   ▶️ Processing Workspace: {ws_name}")
         
         for dataset in workspace_data.get("datasets", []):
             ds_name = dataset.get("name")
@@ -126,7 +133,7 @@ def run_sync_job():
                                     vals = list(row.values())
                                     if not vals: continue
                                     r_id = str(vals[0])
-                                    r_title = f"{ds_name} - {table_name}"
+                                    r_title = f"[{ws_name}] {ds_name} - {table_name}"
                                     r_content = " | ".join([str(v) for v in vals])
                                     
                                     payload = {
